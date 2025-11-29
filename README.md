@@ -6,7 +6,7 @@ This project is a Vision-Language Model (VLM) based API designed to extract line
 * **Framework:** FastAPI
 * **AI Model:** Llama-4 Scout (Vision)
 * **Language:** Python 3.10
-* **Infrastructure:** Docker, Render
+* **Infrastructure:** Docker
 
 ## API Endpoint
 `POST /extract-bill-data`
