@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import fitz  # PyMuPDF
+import time  # <--- Added for rate limiting
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
@@ -13,9 +14,11 @@ load_dotenv()
 logger = logging.getLogger("uvicorn")
 
 # --- CONFIGURATION ---
+# Updated Client with explicit retry logic for Rate Limits
 client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1"
+    base_url="https://api.groq.com/openai/v1",
+    max_retries=5  # <--- Increased from default (2) to 5 to handle 429 errors better
 )
 
 # Using Llama 4 (Scout or Maverick)
@@ -115,6 +118,10 @@ def extract_data_from_image(image: Image.Image, page_num: int):
         if data.get("page_type") not in valid_types:
             # If LLM hallucinates, default to "Bill Detail"
             data["page_type"] = "Bill Detail"
+
+        # --- RATE LIMIT PROTECTION ---
+        # Add a polite delay to allow the Token Bucket to refill
+        time.sleep(2.0) 
             
         return data, response.usage
 
