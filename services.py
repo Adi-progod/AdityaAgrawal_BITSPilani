@@ -3,29 +3,25 @@ import requests
 import os
 import json
 import logging
+import fitz  # PyMuPDF
 from io import BytesIO
-from pdf2image import convert_from_bytes
 from PIL import Image
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
-
-# Logger setup
 logger = logging.getLogger("uvicorn")
 
-# --- CONFIGURATION FOR GROQ (OPEN SOURCE) ---
+# --- CONFIGURATION ---
 client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1"
 )
 
-# Updated to current Groq Vision model (Llama 4 Scout)
+# Using Llama 4 (Scout or Maverick)
 MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 def download_file(url: str) -> bytes:
-    """Downloads the file from the given URL."""
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
@@ -34,40 +30,49 @@ def download_file(url: str) -> bytes:
         logger.error(f"Download failed: {e}")
         raise ValueError(f"Failed to download document: {str(e)}")
 
-def convert_to_images(file_bytes: bytes, content_type: str = "application/pdf") -> list:
-    """Converts PDF bytes or Image bytes into a list of PIL Images."""
+def process_pdf_pages(file_bytes: bytes):
+    """
+    Generator function that yields one PIL Image at a time from a PDF.
+    This saves RAM by not loading all pages at once.
+    """
     try:
-        # Simple heuristic: Check magic bytes or assume based on extension
+        # Check if it's a PDF
         if file_bytes.startswith(b"%PDF"):
-            return convert_from_bytes(file_bytes)
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(dpi=150) # 150 DPI is enough for LLMs, saves RAM
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                yield img
+                # Explicitly close page to free memory
+                del img
+                del pix
+            doc.close()
         else:
-            return [Image.open(BytesIO(file_bytes))]
+            # Assume it's a single image file
+            yield Image.open(BytesIO(file_bytes))
+            
     except Exception as e:
-        logger.error(f"Image conversion failed: {e}")
-        raise ValueError("Failed to process file format. Ensure poppler-utils is installed.")
+        logger.error(f"File processing failed: {e}")
+        raise ValueError("Failed to process file format.")
 
 def encode_image(image: Image.Image) -> str:
-    """Encodes PIL image to base64 string."""
     buffered = BytesIO()
-    # Convert to RGB to handle PNGs with transparency
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
-    image.save(buffered, format="JPEG")
+    image.save(buffered, format="JPEG", quality=85) # Quality 85 reduces base64 size
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 def extract_data_from_image(image: Image.Image, page_num: int):
-    """
-    Sends image to Groq Llama 3.2 Vision for extraction.
-    """
     base64_image = encode_image(image)
     
-    # SYSTEM PROMPT: The core logic to avoid double counting
+    # UPDATED PROMPT: Removed the confusing " | " syntax from the JSON example
     system_prompt = """
     You are an expert financial data extraction AI. Extract line items from this medical bill image.
     
     OUTPUT FORMAT (Strict JSON):
     {
-        "page_type": "Bill Detail | Final Bill | Pharmacy",
+        "page_type": "Bill Detail", 
         "bill_items": [
             {
                 "item_name": "string",
@@ -79,12 +84,11 @@ def extract_data_from_image(image: Image.Image, page_num: int):
     }
     
     CRITICAL RULES:
-    1. EXTRACT ONLY GENUINE LINE ITEMS (services, medicines, tests).
-    2. IGNORE rows labeled: 'Total', 'Subtotal', 'Net Amount', 'Grand Total', 'Discount'.
-    3. 'item_amount' must be the NET amount (Rate x Qty).
+    1. "page_type" MUST be exactly one of these three strings: "Bill Detail", "Final Bill", or "Pharmacy".
+    2. EXTRACT ONLY GENUINE LINE ITEMS.
+    3. IGNORE rows labeled: 'Total', 'Subtotal', 'Grand Total'.
     4. If 'item_quantity' is missing, default to 1.0.
-    5. If 'item_rate' is missing, infer from Amount/Qty.
-    6. Return ONLY valid JSON.
+    5. Return ONLY valid JSON.
     """
 
     try:
@@ -103,19 +107,17 @@ def extract_data_from_image(image: Image.Image, page_num: int):
         )
         
         result_text = response.choices[0].message.content
-        usage = response.usage
+        data = json.loads(result_text)
         
-        # Parse JSON safely
-        try:
-            parsed_data = json.loads(result_text)
-        except json.JSONDecodeError:
-            # Fallback if model returns markdown ticks
-            clean_text = result_text.replace("```json", "").replace("```", "")
-            parsed_data = json.loads(clean_text)
+        # --- SAFETY NET ---
+        # Ensure page_type is valid before returning, otherwise Pydantic will crash.
+        valid_types = ["Bill Detail", "Final Bill", "Pharmacy"]
+        if data.get("page_type") not in valid_types:
+            # If LLM hallucinates, default to "Bill Detail"
+            data["page_type"] = "Bill Detail"
             
-        return parsed_data, usage
+        return data, response.usage
 
     except Exception as e:
         logger.error(f"LLM Extraction failed on page {page_num}: {e}")
-        # Return empty safe structure on failure
         return {"page_type": "Bill Detail", "bill_items": []}, None
