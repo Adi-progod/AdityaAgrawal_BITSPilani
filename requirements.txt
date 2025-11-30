@@ -8,3 +8,4 @@ pydantic
 openai 
 python-dotenv
 pymupdf
+huggingface_hub
